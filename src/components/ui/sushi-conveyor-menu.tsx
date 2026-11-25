@@ -44,6 +44,10 @@ export interface SushiConveyorMenuProps extends React.ComponentProps<"section"> 
   action?: React.ReactNode;
   /** Cruise speed of the belt in px/s, measured on the front lane. */
   speed?: number;
+  /** Movement direction along the front track: "ltr" (left-to-right) or "rtl" (right-to-left). */
+  direction?: "ltr" | "rtl";
+  /** Layout mode: "stacked" (full width belt centered under heading) or "split" (two columns). */
+  layoutMode?: "stacked" | "split";
   /** Stops the belt (controlled). */
   paused?: boolean;
   onPausedChange?: (paused: boolean) => void;
@@ -62,10 +66,10 @@ export interface SushiConveyorMenuProps extends React.ComponentProps<"section"> 
   labels?: SushiConveyorMenuLabels;
 }
 
-const SPACING = 1.35;
-const CURVE = 0.95;
+const SPACING = 1.4;
+const CURVE = 0.72;
 const BAND = 1.22;
-const TILT = 0.8;
+const TILT = 0.65;
 const SLAT = 0.34;
 const LIFT_Y = -6;
 const LIFT_SCALE = 0.08;
@@ -116,6 +120,7 @@ type Geo = {
   slats: number;
   side: number;
   edgeTop: number;
+  ltr: boolean;
 };
 type Point = { x: number; z: number; nx: number; nz: number; tx: number; tz: number };
 type Sim = {
@@ -180,24 +185,43 @@ function tierStyle(tier: number | undefined) {
 
 /** Position on the stadium loop. */
 function along(g: Geo, u: number): Point {
-  const { s, r } = g;
+  const { s, r, ltr } = g;
   let t = ((u % g.l) + g.l) % g.l;
-  if (t < s) return { x: s / 2 - t, z: r, nx: 0, nz: 1, tx: -1, tz: 0 };
-  t -= s;
-  const arc = Math.PI * r;
-  if (t < arc) {
-    const f = t / r;
-    const sin = Math.sin(f);
-    const cos = Math.cos(f);
-    return { x: -s / 2 - r * sin, z: r * cos, nx: -sin, nz: cos, tx: -cos, tz: -sin };
+  let pt: Point;
+  if (t < s) {
+    pt = { x: s / 2 - t, z: r, nx: 0, nz: 1, tx: -1, tz: 0 };
+  } else {
+    t -= s;
+    const arc = Math.PI * r;
+    if (t < arc) {
+      const f = t / r;
+      const sin = Math.sin(f);
+      const cos = Math.cos(f);
+      pt = { x: -s / 2 - r * sin, z: r * cos, nx: -sin, nz: cos, tx: -cos, tz: -sin };
+    } else {
+      t -= arc;
+      if (t < s) {
+        pt = { x: -s / 2 + t, z: -r, nx: 0, nz: -1, tx: 1, tz: 0 };
+      } else {
+        t -= s;
+        const f = Math.min(Math.PI, t / r);
+        const sin = Math.sin(f);
+        const cos = Math.cos(f);
+        pt = { x: s / 2 + r * sin, z: -r * cos, nx: sin, nz: -cos, tx: cos, tz: sin };
+      }
+    }
   }
-  t -= arc;
-  if (t < s) return { x: -s / 2 + t, z: -r, nx: 0, nz: -1, tx: 1, tz: 0 };
-  t -= s;
-  const f = Math.min(Math.PI, t / r);
-  const sin = Math.sin(f);
-  const cos = Math.cos(f);
-  return { x: s / 2 + r * sin, z: -r * cos, nx: sin, nz: -cos, tx: cos, tz: sin };
+  if (ltr) {
+    return {
+      x: -pt.x,
+      z: pt.z,
+      nx: -pt.nx,
+      nz: pt.nz,
+      tx: -pt.tx,
+      tz: pt.tz,
+    };
+  }
+  return pt;
 }
 
 /** Perspective projection */
@@ -206,7 +230,7 @@ function project(g: Geo, x: number, z: number) {
   return { x: g.cx + x * k, y: g.ym + TILT * (g.a * z + (g.b * z * z) / 2), k };
 }
 
-function makeGeo(width: number, n: number, d: number, kb: number): Geo {
+function makeGeo(width: number, n: number, d: number, kb: number, ltr = true): Geo {
   const l = Math.max(1, n) * SPACING * d;
   const r = Math.min(CURVE * d, l / (2 * Math.PI));
   const s = Math.max(0, (l - 2 * Math.PI * r) / 2);
@@ -228,6 +252,7 @@ function makeGeo(width: number, n: number, d: number, kb: number): Geo {
     slats: Math.max(10, Math.round(l / (SLAT * d))),
     side: Math.max(3, d * 0.07),
     edgeTop: 0,
+    ltr,
   };
   let top = Infinity;
   let bottom = -Infinity;
@@ -295,9 +320,10 @@ function centerOf(g: Geo, offset: number) {
 }
 
 function legendEntries(items: ConveyorDish[], legend: { [tier: number]: string } | undefined) {
+  if (!legend) return [];
   const out = [] as { tier: number; label: string }[];
   for (let tier = 1; tier <= 5; tier++) {
-    const label = legend ? legend[tier] : items.find((item) => (item.tier ?? 1) === tier)?.price;
+    const label = legend[tier];
     if (label) out.push({ tier, label });
   }
   return out;
@@ -313,11 +339,13 @@ export function SushiConveyorMenu({
   heading,
   caption,
   action,
-  speed = 26,
+  speed = 24,
+  direction = "ltr",
+  layoutMode = "stacked",
   paused: pausedProp,
   onPausedChange,
-  autoplay = false,
-  interval = 3200,
+  autoplay = true,
+  interval = 3000,
   active: activeProp,
   onActiveChange,
   onOpenChange,
@@ -362,14 +390,16 @@ export function SushiConveyorMenu({
   const wide = size.section >= WIDE;
   const narrow = size.section > 0 && size.section < 480;
   const kb = narrow ? 0.6 : 0.68;
+  const isLtr = direction === "ltr";
+  const isSplit = layoutMode === "split" && wide;
 
   const geo = React.useMemo(() => {
     if (!size.stage || count === 0) return null;
-    const span = halfSpan(makeGeo(1000, count, 100, kb)) / 100;
-    const cap = wide ? 165 : clamp(size.section * 0.158, 106, 165);
-    const fit = (size.stage - 8) / (2 * span);
-    return makeGeo(size.stage, count, Math.round(clamp(fit, Math.min(106, cap), cap)), kb);
-  }, [size.stage, size.section, count, kb, wide]);
+    const span = halfSpan(makeGeo(1000, count, 100, kb, isLtr)) / 100;
+    const cap = isSplit ? 165 : clamp(size.section * 0.14, 115, 160);
+    const fit = (size.stage - 16) / (2 * span);
+    return makeGeo(size.stage, count, Math.round(clamp(fit, Math.min(106, cap), cap)), kb, isLtr);
+  }, [size.stage, size.section, count, kb, isSplit, isLtr]);
 
   const live = React.useRef({
     geo: null as Geo | null,
@@ -587,17 +617,37 @@ export function SushiConveyorMenu({
     [kick]
   );
 
-  const stop = React.useCallback(() => {
-    setPlaying(false);
-    const s = sim.current;
-    s.touched = true;
-    if (s.mode === SEEK) s.mode = RUN;
-    const auto = autoActive.current;
-    if (auto !== null) {
-      autoActive.current = null;
-      if (live.current.active === auto) setActive(null);
-    }
-  }, [setActive]);
+  const resumeTimerRef = React.useRef<number | null>(null);
+
+  const scheduleAutoplayResume = React.useCallback(() => {
+    if (!autoplay) return;
+    if (resumeTimerRef.current) window.clearTimeout(resumeTimerRef.current);
+    resumeTimerRef.current = window.setTimeout(() => {
+      if (!live.current.open && !sim.current.inside) {
+        setPlaying(true);
+      }
+    }, 2200);
+  }, [autoplay]);
+
+  const stop = React.useCallback(
+    (permanent = false) => {
+      if (permanent) {
+        setPlaying(false);
+      }
+      const s = sim.current;
+      s.touched = true;
+      if (s.mode === SEEK) s.mode = RUN;
+      const auto = autoActive.current;
+      if (auto !== null) {
+        autoActive.current = null;
+        if (live.current.active === auto) setActive(null);
+      }
+      if (!permanent && autoplay) {
+        scheduleAutoplayResume();
+      }
+    },
+    [setActive, autoplay, scheduleAutoplayResume]
+  );
 
   const seekTo = React.useCallback(
     (index: number) => {
@@ -626,21 +676,21 @@ export function SushiConveyorMenu({
     if (hit === current) {
       if (hit !== null && autoActive.current === hit) {
         autoActive.current = null;
-        setPlaying(false);
       }
       return;
     }
     if (hit !== null) {
-      stop();
+      stop(false);
       setActive(hit);
       return;
     }
     if (current !== null && current !== autoActive.current && !focusVisible()) setActive(null);
+    scheduleAutoplayResume();
   };
 
   const open = React.useCallback(
     (index: number) => {
-      stop();
+      stop(false);
       setActive(index);
       const s = sim.current;
       s.v = 0;
@@ -658,21 +708,26 @@ export function SushiConveyorMenu({
     setOpenIndex(null);
     live.current.onOpenChange?.(null);
     kick();
-  }, [kick]);
+    scheduleAutoplayResume();
+  }, [kick, scheduleAutoplayResume]);
 
   const go = (index: number, focus: boolean) => {
     if (count === 0) return;
     const next = ((index % count) + count) % count;
-    stop();
+    stop(false);
     if (focus) plates.current[next]?.focus({ preventScroll: true });
     setActive(next);
     seekTo(next);
   };
 
   const togglePause = () => {
-    stop();
     const L = live.current;
     const next = !L.paused;
+    if (next) {
+      stop(true);
+    } else {
+      setPlaying(autoplay);
+    }
     if (!L.pausedControlled) {
       L.paused = next;
       setInnerPaused(next);
@@ -782,11 +837,12 @@ export function SushiConveyorMenu({
   React.useEffect(() => {
     if (!playing || reduced || paused || openIndex !== null || count === 0 || !geoReady) return;
     let timer = 0;
+    const holdTime = Math.min(2000, Math.max(1200, interval - 800));
     const show = () => {
       const g = live.current.geo;
       if (!g) return;
       const last = autoLast.current;
-      const index = last === null ? centerOf(g, sim.current.offset + live.current.speed * 0.25) : (last + 1) % count;
+      const index = last === null ? centerOf(g, sim.current.offset) : (last + 1) % count;
       autoLast.current = index;
       autoActive.current = index;
       setActive(index);
@@ -796,10 +852,10 @@ export function SushiConveyorMenu({
           autoActive.current = null;
           if (live.current.active === index) setActive(null);
         }
-        timer = window.setTimeout(show, Math.max(300, interval - HOLD));
-      }, HOLD);
+        timer = window.setTimeout(show, Math.max(300, interval - holdTime));
+      }, holdTime);
     };
-    timer = window.setTimeout(show, autoLast.current === null ? 1600 : Math.max(300, interval - HOLD));
+    timer = window.setTimeout(show, autoLast.current === null ? 1000 : Math.max(300, interval - holdTime));
     return () => window.clearTimeout(timer);
   }, [playing, reduced, paused, openIndex, count, interval, geoReady, setActive, seekTo]);
 
@@ -863,8 +919,9 @@ export function SushiConveyorMenu({
         p.lastX = event.clientX;
         p.lastT = now;
         const scale = p.lane > 0 ? 1 : 1 / g.kb;
-        s.offset = p.start - p.lane * dx * scale;
-        s.v = live.current.reduced ? 0 : -p.lane * p.v * 1000 * scale;
+        const dir = isLtr ? 1 : -1;
+        s.offset = p.start + dir * p.lane * dx * scale;
+        s.v = live.current.reduced ? 0 : dir * p.lane * p.v * 1000 * scale;
         kick();
       }
       return;
@@ -895,6 +952,7 @@ export function SushiConveyorMenu({
         s.lockY = at.y;
       }
       kick();
+      scheduleAutoplayResume();
       return;
     }
     if (cancelled || p.moved) return;
@@ -938,11 +996,11 @@ export function SushiConveyorMenu({
   const control = "inline-flex size-8 items-center justify-center rounded-full border border-line bg-white text-muted shadow-xs outline-none transition-colors hover:text-ink hover:border-forest/40 focus-visible:ring-2 focus-visible:ring-forest motion-reduce:transition-none";
 
   const header = (eyebrow || heading || tiers.length > 0) && (
-    <div className={wide ? "flex flex-col items-start gap-3.5 text-left" : "flex flex-col items-center gap-2 px-2 text-center"}>
-      {eyebrow && <span className="text-[12.5px] font-semibold uppercase tracking-eyebrow text-forest">{eyebrow}</span>}
-      {heading && <h2 className={`font-heading font-medium tracking-tight text-ink ${wide ? "text-3xl leading-[1.15] xl:text-[40px]" : "text-2xl md:text-3xl"}`}>{heading}</h2>}
+    <div className={isSplit ? "flex flex-col items-start gap-3.5 text-left" : "flex flex-col items-center gap-2 px-2 text-center max-w-3xl mx-auto"}>
+      {eyebrow && <span className="text-[12.5px] font-semibold uppercase tracking-wider text-forest">{eyebrow}</span>}
+      {heading && <h2 className={`font-heading font-medium tracking-tight text-ink ${isSplit ? "text-3xl leading-[1.15] xl:text-[40px]" : "text-3xl sm:text-4xl lg:text-5xl"}`}>{heading}</h2>}
       {tiers.length > 0 && (
-        <ul aria-hidden="true" data-legend className={`mt-1 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11.5px] tabular-nums text-muted ${wide ? "justify-start" : "justify-center"} ${narrow ? "max-w-[15rem]" : ""}`}>
+        <ul aria-hidden="true" data-legend className={`mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11.5px] tabular-nums text-muted ${isSplit ? "justify-start" : "justify-center"} ${narrow ? "max-w-[15rem]" : ""}`}>
           {tiers.map((entry) => (
             <li key={entry.tier} className="inline-flex items-center gap-1.5">
               <span className={`size-2.5 rounded-full border-2 bg-transparent ${tierStyle(entry.tier).ring}`} />
@@ -955,11 +1013,11 @@ export function SushiConveyorMenu({
   );
 
   const captionNode = (
-    <div id={`${uid}-caption`} aria-live="polite" data-caption className={wide ? "min-h-[3.5rem]" : `mx-auto mt-2 max-w-md px-2 text-center ${narrow ? "min-h-[3.75rem]" : "min-h-[2.75rem]"}`}>
+    <div id={`${uid}-caption`} aria-live="polite" data-caption className={isSplit ? "min-h-[3.5rem]" : `mx-auto mt-3 max-w-xl px-4 text-center ${narrow ? "min-h-[4rem]" : "min-h-[3.25rem]"}`}>
       <p className={`text-[15px] sm:text-base ${current ? "font-semibold text-ink" : "text-muted"}`}>
         {current ? (
           <>
-            {current.name} <span className="font-normal tabular-nums text-forest font-medium">· {current.price}</span>
+            {current.name} <span className="font-normal tabular-nums text-forest font-semibold ml-1">· {current.price}</span>
           </>
         ) : (
           caption
@@ -1016,6 +1074,7 @@ export function SushiConveyorMenu({
         s.lock = false;
         const current = live.current.active;
         if (pointer.current.id < 0 && !live.current.open && current !== null && current !== autoActive.current && !focusVisible()) setActive(null);
+        scheduleAutoplayResume();
       }}
       onBlur={(event) => {
         const next = event.relatedTarget as Node | null;
@@ -1173,7 +1232,7 @@ export function SushiConveyorMenu({
       {...rest}
       ref={setSectionRef}
       data-slot="sushi-conveyor-menu"
-      data-layout={wide ? "wide" : "stack"}
+      data-layout={isSplit ? "wide" : "stack"}
       data-active={active ?? ""}
       data-open={openIndex ?? ""}
       data-paused={paused || undefined}
@@ -1185,7 +1244,7 @@ export function SushiConveyorMenu({
         className="pointer-events-none absolute inset-0 -z-10"
         style={{ background: "radial-gradient(64% 52% at 50% 56%, color-mix(in oklab, var(--forest) 4%, transparent), transparent 72%)" }}
       />
-      {wide ? (
+      {isSplit ? (
         <div className="mx-auto grid w-full max-w-7xl grid-cols-[minmax(0,26.5rem)_minmax(0,1fr)] items-center gap-12 px-7 py-11">
           <div className="flex flex-col items-start gap-5">
             {header}
@@ -1198,12 +1257,12 @@ export function SushiConveyorMenu({
           </div>
         </div>
       ) : (
-        <div className="flex w-full flex-col items-center px-4 pb-6 pt-6">
+        <div className="mx-auto flex w-full max-w-[1536px] flex-col items-center px-2 sm:px-4 lg:px-6 pb-8 pt-4">
           {header}
-          <div className="mt-2 w-full min-w-0">{stage}</div>
+          <div className="mt-4 w-full min-w-0">{stage}</div>
           {controls}
           {captionNode}
-          {action && <div className="mt-3 flex justify-center">{action}</div>}
+          {action && <div className="mt-4 flex justify-center">{action}</div>}
         </div>
       )}
       {openIndex !== null && items[openIndex] && (
